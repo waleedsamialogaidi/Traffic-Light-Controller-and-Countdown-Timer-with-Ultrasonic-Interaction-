@@ -1,0 +1,496 @@
+#include <xc.h>          // PIC hardware register definitions (XC8 compiler)
+#include <stdint.h>      // Standard integer types: uint8_t, uint16_t, ...
+#include <stdbool.h>     // Boolean type: bool, true, false
+
+#define _XTAL_FREQ 4000000   // MCU clock for __delay_ms/__delay_us (4 MHz crystal)
+
+#pragma config FOSC = XT, WDTE = OFF, PWRTE = ON, BOREN = ON   // Oscillator + watchdog + power-up + brown-out
+#pragma config LVP = OFF, CPD = OFF, WRT = OFF, CP = OFF       // Disable low-voltage prog, code protection, etc.
+
+// ================= LCD wiring (PORTD) =================
+// LCD in 4-bit mode: RS & EN on RD0,RD1 and data D4..D7 on RD4..RD7
+#define LCD_RS PORTDbits.RD0
+#define LCD_EN PORTDbits.RD1
+#define LCD_D4 PORTDbits.RD4
+#define LCD_D5 PORTDbits.RD5
+#define LCD_D6 PORTDbits.RD6
+#define LCD_D7 PORTDbits.RD7
+
+// ================= Ultrasonic (PORTC) =================
+// HC-SR04 style: TRIG output, ECHO input
+#define US_TRIG PORTCbits.RC0
+#define US_ECHO PORTCbits.RC1
+
+// ================= Buzzer (PORTC) =================
+// Active buzzer ON/OFF control output
+#define BUZZER  PORTCbits.RC2
+
+// ================= Traffic LEDs (PORTC) =================
+// Three LEDs for traffic light states
+#define LED_RED    PORTCbits.RC3
+#define LED_YELLOW PORTCbits.RC4
+#define LED_GREEN  PORTCbits.RC5
+
+// ================= Traffic timing =================
+// Fixed durations for each state (seconds) + distance threshold for crossing (cm)
+#define RED_SEC     15u
+#define GREEN_SEC   10u
+#define YELLOW_SEC   5u
+#define CROSS_CM    15u
+
+// ================= Timer mode =================
+// Distance (cm) used to stop the buzzer by waving a hand near the ultrasonic sensor
+#define HAND_STOP_CM 10u
+
+// ---------- LCD ----------
+// Pulse the LCD enable line to latch current data on D4..D7
+static void lcd_pulse(void){
+    LCD_EN = 1; __delay_us(5);    // EN high briefly
+    LCD_EN = 0; __delay_us(80);   // EN low, wait for LCD to accept nibble
+}
+
+// Put a 4-bit nibble on D4..D7 and latch it (4-bit LCD interface)
+static void lcd_put_nibble(uint8_t n){
+    LCD_D4 = (n >> 0) & 1;
+    LCD_D5 = (n >> 1) & 1;
+    LCD_D6 = (n >> 2) & 1;
+    LCD_D7 = (n >> 3) & 1;
+    lcd_pulse();                  // latch this nibble into LCD
+}
+
+// Write a full byte to LCD: send upper nibble then lower nibble (rs=0 command, rs=1 data)
+static void lcd_write(uint8_t rs, uint8_t data){
+    LCD_RS = rs;                  // select instruction/data register
+    lcd_put_nibble(data >> 4);    // high nibble first
+    lcd_put_nibble(data & 0x0F);  // low nibble
+}
+
+// Send LCD command byte
+static void lcd_cmd(uint8_t cmd){
+    lcd_write(0, cmd);            // rs=0 => command
+    if(cmd == 0x01 || cmd == 0x02) __delay_ms(3); // clear/home need longer time
+}
+
+// Send one character to LCD (data byte)
+static void lcd_data(uint8_t d){ lcd_write(1, d); }
+
+// Print a C-string to LCD
+static void lcd_puts(const char *s){ while(*s) lcd_data((uint8_t)*s++); }
+
+// Set cursor position (row=1 or 2, col starts at 1)
+static void lcd_goto(uint8_t row, uint8_t col){
+    uint8_t addr = (row == 1) ? 0x00 : 0x40; // DDRAM base address for each row
+    addr += (uint8_t)(col - 1);              // column offset
+    lcd_cmd(0x80 | addr);                    // set DDRAM address command
+}
+
+// Initialize LCD in 4-bit mode, 2-line display
+static void lcd_init(void){
+    TRISD = 0x00;       // PORTD pins as outputs (LCD)
+    PORTD = 0x00;       // clear PORTD
+    LCD_RS = 0; LCD_EN = 0;
+
+    __delay_ms(100);    // LCD power-up delay
+
+    // Standard 4-bit initialization sequence
+    lcd_put_nibble(0x03); __delay_ms(5);
+    lcd_put_nibble(0x03); __delay_ms(5);
+    lcd_put_nibble(0x03); __delay_ms(5);
+    lcd_put_nibble(0x02); __delay_ms(5); // switch to 4-bit mode
+
+    lcd_cmd(0x28);      // Function set: 4-bit, 2 lines, 5x8 font
+    lcd_cmd(0x0C);      // Display ON, cursor OFF
+    lcd_cmd(0x01);      // Clear display
+    lcd_cmd(0x06);      // Entry mode: increment cursor
+}
+
+// ---------- Timer1 1ms ----------
+// ms_count accumulates milliseconds; tick_1s becomes true each 1000 ms
+volatile uint16_t ms_count = 0;
+volatile bool tick_1s = false;
+
+// Interrupt service routine: runs when Timer1 overflows (TMR1IF flag)
+void __interrupt() isr(void){
+    if(PIR1bits.TMR1IF){
+        PIR1bits.TMR1IF = 0;      // clear interrupt flag
+
+        // Reload Timer1 for ~1ms tick at 4MHz with chosen settings
+        TMR1H = 0xFC;
+        TMR1L = 0x18;
+
+        ms_count++;               // count milliseconds
+        if(ms_count >= 1000){     // reached 1 second
+            ms_count = 0;
+            tick_1s = true;       // signal main loop that 1 second passed
+        }
+    }
+}
+
+// Configure Timer1 to generate periodic interrupts ~every 1ms
+static void timer1_init_1ms(void){
+    T1CONbits.TMR1CS = 0;     // Timer1 clock source = Fosc/4 (internal)
+    T1CONbits.T1CKPS0 = 0;    // Prescaler = 1:1
+    T1CONbits.T1CKPS1 = 0;
+    T1CONbits.TMR1ON = 0;     // keep Timer1 OFF while configuring
+
+    TMR1H = 0xFC;             // preload value for 1ms overflow interval
+    TMR1L = 0x18;
+
+    PIR1bits.TMR1IF = 0;      // clear pending Timer1 interrupt flag
+    PIE1bits.TMR1IE = 1;      // enable Timer1 interrupt
+    INTCONbits.PEIE = 1;      // enable peripheral interrupts
+    INTCONbits.GIE  = 1;      // enable global interrupts
+
+    T1CONbits.TMR1ON = 1;     // start Timer1
+}
+
+// ---------- Ultrasonic ----------
+// Configure ultrasonic pins (TRIG output, ECHO input)
+static void ultrasonic_init(void){
+    TRISCbits.TRISC0 = 0;     // RC0 (TRIG) output
+    TRISCbits.TRISC1 = 1;     // RC1 (ECHO) input
+    US_TRIG = 0;              // TRIG idle low
+}
+
+// Read distance in cm using Timer1 as a pulse width timer
+// Returns 0xFFFF on timeout/invalid measurement
+static uint16_t ultrasonic_read_cm(void){
+    uint16_t t;
+
+    // Save interrupt and Timer1 state (because we temporarily take over Timer1)
+    uint8_t gie_save = INTCONbits.GIE;
+    uint8_t tmr1ie_save = PIE1bits.TMR1IE;
+    uint8_t t1con_save = T1CON;
+
+    // Disable interrupts and Timer1 interrupt so measurement is not disturbed
+    INTCONbits.GIE = 0;
+    PIE1bits.TMR1IE = 0;
+    T1CONbits.TMR1ON = 0;
+
+    // Timer1 internal clock, prescaler 1:1 for measuring echo pulse width
+    T1CONbits.TMR1CS = 0;
+    T1CONbits.T1CKPS0 = 0;
+    T1CONbits.T1CKPS1 = 0;
+
+    // If ECHO is stuck high, wait until it goes low (timeout protection)
+    TMR1H = 0; TMR1L = 0;
+    T1CONbits.TMR1ON = 1;
+    while(US_ECHO){
+        if((((uint16_t)TMR1H<<8) | TMR1L) > 30000U){
+            T1CONbits.TMR1ON = 0;
+            // Restore previous Timer1 + interrupts and report error
+            T1CON = t1con_save; PIE1bits.TMR1IE = tmr1ie_save; INTCONbits.GIE = gie_save;
+            return 0xFFFF;
+        }
+    }
+    T1CONbits.TMR1ON = 0;
+
+    // Send 10us trigger pulse to start ultrasonic measurement
+    US_TRIG = 0; __delay_us(2);
+    US_TRIG = 1; __delay_us(10);
+    US_TRIG = 0;
+
+    // Wait for ECHO to go high (start of pulse), with timeout
+    TMR1H = 0; TMR1L = 0;
+    T1CONbits.TMR1ON = 1;
+    while(!US_ECHO){
+        if((((uint16_t)TMR1H<<8) | TMR1L) > 30000U){
+            T1CONbits.TMR1ON = 0;
+            // Restore and error
+            T1CON = t1con_save; PIE1bits.TMR1IE = tmr1ie_save; INTCONbits.GIE = gie_save;
+            return 0xFFFF;
+        }
+    }
+
+    // Measure how long ECHO stays high (pulse width)
+    TMR1H = 0; TMR1L = 0;     // reset timer at rising edge
+    while(US_ECHO){
+        if((((uint16_t)TMR1H<<8) | TMR1L) > 30000U) break; // safety break
+    }
+    T1CONbits.TMR1ON = 0;
+
+    t = (((uint16_t)TMR1H<<8) | TMR1L); // captured pulse duration count
+
+    // Restore previous Timer1 configuration and interrupts
+    T1CON = t1con_save;
+    PIE1bits.TMR1IE = tmr1ie_save;
+    INTCONbits.GIE = gie_save;
+
+    if(t == 0) return 0xFFFF;       // invalid read
+    return (uint16_t)(t / 58U);     // convert pulse to cm (approx factor)
+}
+
+// ---------- Keypad ----------
+// 4x4 keypad map: rows x columns => character
+static const char keymap[4][4] = {
+    {'1','2','3','A'}, {'4','5','6','B'},
+    {'7','8','9','C'}, {'*','0','#','D'}
+};
+
+// Configure PORTB for keypad: RB0..RB3 inputs (rows), RB4..RB7 outputs (cols)
+static void keypad_init(void){
+    TRISB = 0x0F;              // lower 4 bits input, upper 4 bits output
+    OPTION_REGbits.nRBPU = 0;  // enable PORTB weak pull-ups
+    PORTB = 0xF0;              // columns default high
+}
+
+// Scan keypad by driving one column low at a time and reading rows
+static char keypad_scan(void){
+    for(uint8_t col=0; col<4; col++){
+        PORTB = 0xF0;                              // set all cols high
+        PORTB &= (uint8_t)~(0x10u << col);         // drive one column low
+        __delay_us(20);                            // settle
+        uint8_t rows = PORTB & 0x0F;               // read row inputs
+        for(uint8_t row=0; row<4; row++){
+            if(((rows >> row) & 1u) == 0u) return keymap[row][col]; // pressed = low
+        }
+    }
+    return 0; // no key pressed
+}
+
+// Debounced key reading: returns a key only once per press
+static char keypad_getkey(void){
+    static char last = 0;      // remembers previous key state
+    char k = keypad_scan();
+    if(k != 0 && last == 0){
+        __delay_ms(30);        // debounce delay
+        k = keypad_scan();
+        if(k != 0){ last = k; return k; } // confirm and return new key
+    } else if(k == 0){
+        last = 0;              // key released
+    }
+    return 0;
+}
+
+// ---------- Menu ----------
+// Startup menu: choose mode 1 (traffic) or 2 (timer)
+static uint8_t choose_mode_startup(void){
+    lcd_cmd(0x01);                     // clear LCD
+    lcd_goto(1,1); lcd_puts("1:Traffic Light ");
+    lcd_goto(2,1); lcd_puts("2:Timer         ");
+    while(1){
+        char k = keypad_getkey();
+        if(k == '1') return 1;         // user chose traffic
+        if(k == '2') return 2;         // user chose timer
+        __delay_ms(20);
+    }
+}
+
+// ---------- Helpers ----------
+// Print 2-digit number (00..99) to LCD
+static void lcd_print2(uint16_t v){
+    lcd_data((uint8_t)((v/10)%10 + '0'));
+    lcd_data((uint8_t)(v%10 + '0'));
+}
+
+// Convert seconds to "MM:SS" string
+static void format_mmss(uint16_t sec, char *out){
+    uint16_t mm = sec / 60;
+    uint16_t ss = sec % 60;
+    out[0] = (char)((mm/10) + '0');
+    out[1] = (char)((mm%10) + '0');
+    out[2] = ':';
+    out[3] = (char)((ss/10) + '0');
+    out[4] = (char)((ss%10) + '0');
+    out[5] = '\0';
+}
+
+// ===================== MODE 1: Traffic =====================
+// State machine for traffic lights
+typedef enum { ST_RED=0, ST_GREEN=1, ST_YELLOW=2 } state_t;
+
+// Turn off all LEDs then enable the one for current state
+static void set_lights(state_t st){
+    LED_RED = 0; LED_GREEN = 0; LED_YELLOW = 0;
+    if(st == ST_RED) LED_RED = 1;
+    else if(st == ST_GREEN) LED_GREEN = 1;
+    else LED_YELLOW = 1;
+}
+
+// Update LCD to show current state, remaining seconds, and crossing condition
+static void lcd_show_traffic(state_t st, uint16_t rem){
+    lcd_goto(1,1);
+    if(st == ST_RED)        lcd_puts("RED   ");
+    else if(st == ST_GREEN) lcd_puts("GREEN ");
+    else                    lcd_puts("YELLOW");
+    lcd_puts("Time:");
+    lcd_print2(rem);
+    lcd_puts("s   ");
+
+    lcd_goto(2,1);
+    lcd_puts("Cross<=");
+    lcd_print2(CROSS_CM);
+    lcd_puts("cm => RED ");
+}
+
+// Traffic mode loop:
+// - cycles RED->GREEN->YELLOW with fixed times
+// - ultrasonic triggers immediate RED reset if object <= CROSS_CM
+// - '*' key exits back to menu
+static void run_traffic_mode(void){
+    state_t st = ST_RED;               // start with RED
+    uint16_t remaining = RED_SEC;      // initial countdown
+    set_lights(st);
+    lcd_show_traffic(st, remaining);
+
+    uint16_t us_check_ms = 0;          // used to periodically check ultrasonic
+
+    while(1){
+        char k = keypad_getkey();
+        if(k == '*') return;           // exit mode
+
+        // Check ultrasonic roughly every 120ms (loop sleeps 20ms)
+        us_check_ms += 20;
+        if(us_check_ms >= 120){
+            us_check_ms = 0;
+            uint16_t d = ultrasonic_read_cm();
+            if(d != 0xFFFF && d > 0 && d <= CROSS_CM){
+                // If someone/object is close enough => force RED and reset time
+                st = ST_RED;
+                remaining = RED_SEC;
+                set_lights(st);
+                lcd_show_traffic(st, remaining);
+                BUZZER = 1; __delay_ms(60); BUZZER = 0; // short beep indication
+            }
+        }
+
+        // Every second: decrement timer, change state when it reaches 0
+        if(tick_1s){
+            tick_1s = false;
+            if(remaining > 0) remaining--;
+            if(remaining == 0){
+                if(st == ST_RED){ st = ST_GREEN;  remaining = GREEN_SEC; }
+                else if(st == ST_GREEN){ st = ST_YELLOW; remaining = YELLOW_SEC; }
+                else { st = ST_RED; remaining = RED_SEC; }
+                set_lights(st);        // update LEDs for new state
+            }
+            lcd_show_traffic(st, remaining); // refresh display
+        }
+        __delay_ms(20);                // loop pacing
+    }
+}
+
+// ===================== MODE 2: Timer =====================
+// Timer mode loop:
+// - user enters MMSS (4 digits max), press D to set, A to start, B pause/resume, C clear
+// - when reaches 0 buzzer stays ON until hand detected within HAND_STOP_CM
+// - '*' key exits back to menu
+static void run_timer_mode(void){
+    bool running=false, paused=false;              // state flags
+    uint16_t input_mmss=0, input_digits=0, remaining_sec=0; // user entry and countdown
+    char tbuf[6];                                 // "MM:SS" buffer
+
+    BUZZER = 0;                                   // ensure buzzer off
+    lcd_cmd(0x01);                                // clear LCD
+
+    while(1){
+        char k = keypad_getkey();
+        if(k == '*'){ BUZZER = 0; return; }       // exit mode, stop buzzer
+
+        // If buzzer is on, allow ultrasonic hand-stop
+        if(BUZZER){
+            uint16_t d = ultrasonic_read_cm();
+            if(d != 0xFFFF && d > 0 && d <= HAND_STOP_CM){
+                BUZZER = 0;                       // stop buzzer if hand is close enough
+            }
+        }
+
+        // Handle keypad commands
+        if(k){
+            // Enter digits for MMSS only when not running
+            if(k>='0' && k<='9' && !running && input_digits < 4){
+                input_mmss = (uint16_t)(input_mmss*10u + (uint16_t)(k-'0'));
+                input_digits++;
+            } else if(k=='*'){
+                // handled above
+            } else if(k=='D'){
+                // Set the entered time as countdown (clamp SS to 59)
+                if(!running){
+                    uint16_t mm = input_mmss/100u;
+                    uint16_t ss = input_mmss%100u;
+                    if(ss > 59) ss = 59;
+                    remaining_sec = (uint16_t)(mm*60u + ss);
+                }
+            } else if(k=='A'){
+                // Start countdown if time is nonzero
+                if(remaining_sec > 0){ running = true; paused = false; }
+            } else if(k=='B'){
+                // Toggle pause/resume while running
+                if(running) paused = !paused;
+            } else if(k=='C'){
+                // Clear everything and stop buzzer
+                running=false; paused=false;
+                remaining_sec=0; input_mmss=0; input_digits=0;
+                BUZZER=0;
+            }
+        }
+
+        // Each second: if running and not paused, decrement countdown
+        if(tick_1s){
+            tick_1s = false;
+            if(running && !paused && remaining_sec > 0){
+                remaining_sec--;
+                if(remaining_sec == 0){
+                    running = false;
+                    BUZZER = 1;                   // time finished => buzzer ON until hand-stop
+                }
+            }
+        }
+
+        // Update LCD display depending on state (running vs setting)
+        lcd_goto(1,1);
+        if(running){
+            lcd_puts("TIME: ");
+            format_mmss(remaining_sec, tbuf);
+            lcd_puts(tbuf);
+            lcd_puts("     ");
+            lcd_goto(2,1);
+            lcd_puts(paused ? "PAUSED          " : "RUNNING         ");
+        } else {
+            lcd_puts("SET : ");
+            {
+                // Show the entered value as MM:SS (clamp seconds)
+                uint16_t mm = input_mmss/100u;
+                uint16_t ss = input_mmss%100u;
+                if(ss > 59) ss = 59;
+                format_mmss((uint16_t)(mm*60u + ss), tbuf);
+                lcd_puts(tbuf);
+                lcd_puts("     ");
+            }
+            lcd_goto(2,1);
+            lcd_puts(BUZZER ? "HAND TO STOP!   " : "READY           ");
+        }
+        __delay_ms(20);                            // loop pacing
+    }
+}
+
+// ===================== MAIN =====================
+int main(void){
+    ADCON1 = 0x06;                 // configure PORTA/PORTE as digital (disable analog inputs)
+
+    // Configure output pins on PORTC for buzzer + LEDs
+    TRISCbits.TRISC2 = 0;          // buzzer pin output
+    TRISCbits.TRISC3 = 0;          // red LED output
+    TRISCbits.TRISC4 = 0;          // yellow LED output
+    TRISCbits.TRISC5 = 0;          // green LED output
+
+    BUZZER = 0;                    // initial outputs off
+    LED_RED = 0; LED_YELLOW = 0; LED_GREEN = 0;
+
+    // Initialize peripherals
+    lcd_init();                    // LCD ready
+    keypad_init();                 // keypad ready
+    ultrasonic_init();             // ultrasonic pins ready
+    timer1_init_1ms();             // start 1ms interrupt ticker (tick_1s)
+
+    while(1){
+        uint8_t mode = choose_mode_startup();  // user picks mode every time
+
+        if(mode == 1){
+            run_traffic_mode();                // run until user presses '*'
+        } else {
+            LED_RED = 0; LED_YELLOW = 0; LED_GREEN = 0; // ensure LEDs off in timer mode
+            run_timer_mode();                  // run until user presses '*'
+        }
+    }
+}
